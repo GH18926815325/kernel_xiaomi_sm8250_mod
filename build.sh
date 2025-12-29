@@ -1,57 +1,67 @@
 #!/bin/bash
 
-# 确保脚本遇到错误立即退出
-set -e
+# 1. 严格错误控制：遇到未定义变量或命令失败立即停止
+set -euo pipefail
 
 # --- 1. 基础环境配置 ---
-# 注意：请确保工具链路径正确
-TOOLCHAIN_PATH=$HOME/proton-clang/proton-clang-20210522/bin
-GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
-TARGET_DEVICE="pipa" # 直接固定为 pipa
+# 确保工具链路径是绝对路径
+TOOLCHAIN_PATH="$HOME/proton-clang/proton-clang-20210522/bin"
+GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD || echo "unknown")
+TARGET_DEVICE="pipa" 
 
-# 检查工具链
-if [ ! -d $TOOLCHAIN_PATH ]; then
-    echo "错误：未找到工具链 $TOOLCHAIN_PATH"
+echo "==== 正在初始化编译环境 ===="
+if [ ! -d "$TOOLCHAIN_PATH" ]; then
+    echo "错误：未找到工具链目录: $TOOLCHAIN_PATH"
     exit 1
 fi
 
+# 设置环境变量
 export PATH="$TOOLCHAIN_PATH:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
+export KBUILD_BUILD_USER="Gemini"
+export KBUILD_BUILD_HOST="Android-Build"
 
-# 使用 ccache 加速编译
+# ccache 配置
 export CCACHE_DIR="$HOME/.cache/ccache_pipa"
-export CC="ccache gcc"
-export CXX="ccache g++"
+export CC="ccache clang" # 修正为直接使用 clang
+export CXX="ccache clang++"
 export PATH="/usr/lib/ccache:$PATH"
 
 # 定义交叉编译参数
-MAKE_ARGS="O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
+MAKE_ARGS="O=out \
+    ARCH=arm64 \
+    CC=clang \
+    CROSS_COMPILE=aarch64-linux-gnu- \
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+    CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+    CLANG_TRIPLE=aarch64-linux-gnu-"
 
-# --- 2. 处理 KernelSU (根据输入参数) ---
-KSU_ZIP_STR=NoKernelSU
-if [ "$1" == "ksu" ]; then
+# --- 2. 处理 KernelSU (SukiSU) ---
+KSU_ZIP_STR="NoKernelSU"
+if [ "${1:-}" == "ksu" ]; then
     KSU_ENABLE=1
-    KSU_ZIP_STR=SukiSU-SUSFS
-    echo "正在集成 KernelSU/SUSFS..."
+    KSU_ZIP_STR="SukiSU-SUSFS"
+    echo ">>>> 正在集成 KernelSU (SukiSU) 与 SUSFS <<<<"
+    # 使用 -s 确保 setup.sh 能正确识别参数
     curl -LSs "https://raw.githubusercontent.com/ApartTUSITU/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-1.5.7
 else
     KSU_ENABLE=0
 fi
 
 # --- 3. 准备打包环境 ---
-rm -rf out/ anykernel/
-echo "克隆 AnyKernel3 模板..."
+echo ">>>> 清理旧文件并下载 AnyKernel3 <<<<"
+rm -rf out anykernel
 git clone https://github.com/liyafe1997/AnyKernel3 -b kona --single-branch --depth=1 anykernel
 
-# --- 4. 配置与 MIUI 特性启用 ---
-echo "正在载入 ${TARGET_DEVICE}_defconfig..."
-make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
+# --- 4. 配置内核与 MIUI 特性 ---
+echo ">>>> 正在配置 ${TARGET_DEVICE}_defconfig <<<<"
+make $MAKE_ARGS "${TARGET_DEVICE}_defconfig"
 
-# 启用 MIUI 专用内核功能和优化
-echo "正在注入 MIUI 特性开关..."
-scripts/config --file out/.config \
-    --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
+echo ">>>> 正在注入 MIUI 优化参数 <<<<"
+# 启用小米核心功能
+./scripts/config --file out/.config \
+    --set-str STATIC_USERMODEHELPER_PATH "/system/bin/micd" \
     -e PERF_CRITICAL_RT_TASK \
     -e OVERLAY_FS \
     -e MIGT \
@@ -65,45 +75,60 @@ scripts/config --file out/.config \
     -d LTO_CLANG \
     -d LOCALVERSION_AUTO
 
-# 处理 KSU 开关
+# 处理 KSU 内核开关
 if [ $KSU_ENABLE -eq 1 ]; then
-    scripts/config --file out/.config -e KSU -e KSU_TRACEPOINT_HOOK -e KSU_SUSFS_HAS_MAGIC_MOUNT
+    ./scripts/config --file out/.config \
+        -e KSU \
+        -e KSU_TRACEPOINT_HOOK \
+        -e KSU_SUSFS_HAS_MAGIC_MOUNT
 else
-    scripts/config --file out/.config -d KSU
+    ./scripts/config --file out/.config -d KSU
 fi
 
 # --- 5. 执行正式编译 ---
-echo "开始编译 MIUI 版内核..."
+echo ">>>> 开始编译 MIUI 版内核 (使用 $(nproc) 核心) <<<<"
 make $MAKE_ARGS -j$(nproc)
 
-# --- 6. 打包产物 ---
+# --- 6. 产物校验与打包 ---
 if [ ! -f "out/arch/arm64/boot/Image" ]; then
-    echo "编译失败：未找到 Image 文件"
+    echo "!! 编译失败：未检测到 Image 产物 !!"
     exit 1
 fi
 
-echo "生成 DTB 设备树..."
-find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + >out/arch/arm64/boot/dtb
+echo ">>>> 正在合并 DTB 设备树 <<<<"
+# 修正 DTB 合并逻辑，pipa 的 dtb 通常在 qcom 目录下
+find out/arch/arm64/boot/dts/vendor/qcom -name "*.dtb" -exec cat {} + > out/arch/arm64/boot/dtb || \
+find out/arch/arm64/boot/dts -name "*.dtb" -exec cat {} + > out/arch/arm64/boot/dtb
 
-# 如果是 KSU，运行特殊的补丁程序处理 Image
+# 如果是 KSU 版本，执行 KPM 补丁
 if [ $KSU_ENABLE -eq 1 ]; then
-    cd out/arch/arm64/boot/
-    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
-    chmod +x patch_linux
-    ./patch_linux
-    mv oImage Image
-    cd -
+    echo ">>>> 应用 SukiSU KPM 补丁 <<<<"
+    (
+        cd out/arch/arm64/boot/
+        wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+        chmod +x patch_linux
+        ./patch_linux || echo "补丁脚本执行异常，请检查"
+        [ -f oImage ] && mv oImage Image
+    )
 fi
 
-# 移动到打包目录
-cp out/arch/arm64/boot/Image anykernel/kernels/
+echo ">>>> 准备 AnyKernel3 打包目录 <<<<"
+# 核心修复：确保目录结构存在且 Image 命名符合 anykernel.sh 的预期
+mkdir -p anykernel/kernels
+cp out/arch/arm64/boot/Image anykernel/Image # 兼容根目录
+cp out/arch/arm64/boot/Image anykernel/kernels/ # 兼容 kernels 目录
+cp out/arch/arm64/boot/dtb anykernel/dtb
 cp out/arch/arm64/boot/dtb anykernel/kernels/
 
 # 创建 flashable zip
+echo ">>>> 正在生成最终 Zip 包 <<<<"
 cd anykernel
 ZIP_NAME="Kernel_MIUI_pipa_${KSU_ZIP_STR}_$(date +%Y%m%d_%H%M).zip"
-zip -r9 ../$ZIP_NAME ./* -x .git .gitignore out/ ./*.zip
+zip -r9 "$ZIP_NAME" ./* -x ".git/*" ".gitignore" "*.zip"
+mv "$ZIP_NAME" ../
 cd ..
 
-echo "---------------------------------------"
-echo "编译完成！刷机包已生成：$ZIP_NAME"
+echo "======================================="
+echo "编译成功！"
+echo "产物名称: $ZIP_NAME"
+echo "======================================="
